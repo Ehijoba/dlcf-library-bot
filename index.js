@@ -1,5 +1,4 @@
-// index.js - Telegram Library Bot (Render-ready)
-// Reads sheet: id | title | author | file_id
+// index.js - Updated: admin detection + admin/user-specific messages + admin notifications
 require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
@@ -7,18 +6,20 @@ const { google } = require('googleapis');
 const Fuse = require('fuse.js');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const ADMIN_IDS_RAW = process.env.ADMIN_IDS || process.env.ADMIN_ID || ''; // support both
+const ADMIN_IDS = ADMIN_IDS_RAW.split(',').map(s => s.trim()).filter(Boolean);
 const SHEET_ID = process.env.SHEET_ID;
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
 const SA_BASE64 = process.env.GOOGLE_SERVICE_ACCOUNT_BASE64;
 
+// Basic env validation
 if (!BOT_TOKEN || ADMIN_IDS.length === 0 || !SHEET_ID || !SA_BASE64 || !BASE_URL) {
-  console.error('Missing required env vars. Required: BOT_TOKEN, ADMIN_IDS, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64, BASE_URL');
+  console.error('Missing required env vars. Required: BOT_TOKEN, ADMIN_IDS (or ADMIN_ID), SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64, BASE_URL');
   process.exit(1);
 }
 
-// Google Sheets auth
+// parse service account JSON
 let svcJson;
 try {
   svcJson = JSON.parse(Buffer.from(SA_BASE64, 'base64').toString('utf8'));
@@ -26,6 +27,7 @@ try {
   console.error('Failed to parse GOOGLE_SERVICE_ACCOUNT_BASE64:', err.message);
   process.exit(1);
 }
+
 const jwt = new google.auth.JWT(
   svcJson.client_email,
   null,
@@ -34,16 +36,16 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: 'v4', auth: jwt });
 
-// Telegram in webhook mode
+// Telegram setup (webhook)
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-// In-memory book index: array of {id, title, author, file_id}
+// In-memory books index
 let books = [];
 let fuse = new Fuse([], { keys: ['title', 'author', 'id'], threshold: 0.35, includeScore: true });
 
-// Helper: load sheet (Sheet1!A:D)
+// load sheet (expects Sheet1!A:D -> id | title | author | file_id)
 async function loadSheet() {
   try {
     const res = await sheets.spreadsheets.values.get({
@@ -51,7 +53,6 @@ async function loadSheet() {
       range: 'Sheet1!A:D'
     });
     const rows = res.data.values || [];
-    // Expect header row at rows[0]
     const parsed = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
@@ -64,13 +65,13 @@ async function loadSheet() {
     books = parsed;
     fuse = new Fuse(books, { keys: ['title', 'author', 'id'], threshold: 0.35, includeScore: true });
     console.log(`Loaded ${books.length} books from sheet`);
+    return true;
   } catch (err) {
     console.error('loadSheet error:', err.message);
     throw err;
   }
 }
 
-// Helper: append row [id,title,author,file_id]
 async function appendRow(id, title, author, file_id) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
@@ -81,13 +82,13 @@ async function appendRow(id, title, author, file_id) {
   console.log('Appended row:', id, title);
 }
 
-// Webhook endpoint for Telegram
+// webhook endpoint
 app.post(`/webhook/${BOT_TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Start server & set webhook
+// start server + set webhook
 app.listen(PORT, async () => {
   console.log('Server started on port', PORT);
   const webhookUrl = `${BASE_URL.replace(/\/$/, '')}/webhook/${BOT_TOKEN}`;
@@ -97,7 +98,6 @@ app.listen(PORT, async () => {
   } catch (err) {
     console.error('Failed to set webhook:', err.message);
   }
-  // Load sheet at startup
   try {
     await loadSheet();
   } catch (e) {
@@ -105,27 +105,54 @@ app.listen(PORT, async () => {
   }
 });
 
-// UTIL: is admin?
+// helpers
 function isAdmin(userId) {
   return ADMIN_IDS.includes(String(userId));
 }
 
-// /start
+function adminNotifyText(request) {
+  // request: { userId, userName, query, time }
+  return `📚 *Book request*\nUser: ${request.userName} (id: ${request.userId})\nQuery: "${request.query}"\nTime: ${request.time}\n\nSend the file to the bot (admin chat) or add to sheet.`;
+}
+
+async function notifyAdminsAboutRequest(request) {
+  for (const adminId of ADMIN_IDS) {
+    try {
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Mark as handled', callback_data: `handled:${request.time}:${request.userId}` }
+          ]]
+        }
+      };
+      await bot.sendMessage(adminId, adminNotifyText(request), opts);
+    } catch (e) {
+      console.error('notify admin failed for', adminId, e.message);
+    }
+  }
+}
+
+// temp storage for admin-upload-without-caption flow
+const waitingForMeta = {};
+
+// bot handlers
+
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  const txt = `📚 Welcome to the Library Bot.\n\nHow to use:\n• Type a book title, author, or id and I'll search.\n\nAdmins can send a document with caption: id|title|author to add it automatically.`;
-  bot.sendMessage(chatId, txt);
+  const textUser = `📚 Welcome to the library bot!\n\nType a book title, author, or ID and I'll search our collection.`;
+  const textAdmin = `📚 Welcome back, Librarian.\n• Send a document with caption: id|title|author to save it automatically.\n• Or send without caption and reply to the bot's prompt with id|title|author.`;
+  const text = isAdmin(msg.from.id) ? textAdmin : textUser;
+  bot.sendMessage(chatId, text);
 });
 
-// /list
 bot.onText(/\/list/, (msg) => {
   const sample = books.slice(0, 30).map(b => `${b.id || '-'} | ${b.title} — ${b.author || '-'}`).join('\n') || 'No books yet';
   bot.sendMessage(msg.chat.id, `Books (first 30):\n${sample}`);
 });
 
-// /reload (admin only)
 bot.onText(/\/reload/, async (msg) => {
-  if (!isAdmin(msg.from.id)) return bot.sendMessage(msg.chat.id, 'Only admin can use /reload');
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(msg.chat.id, 'Only admins can use /reload.');
   bot.sendMessage(msg.chat.id, 'Reloading sheet...');
   try {
     await loadSheet();
@@ -135,62 +162,71 @@ bot.onText(/\/reload/, async (msg) => {
   }
 });
 
-// Search & send file_id on any private text message
+// handle callback query (admin pressed "Mark as handled")
+bot.on('callback_query', async (cq) => {
+  const data = cq.data || '';
+  if (!cq.from || !isAdmin(cq.from.id)) {
+    return bot.answerCallbackQuery(cq.id, { text: 'Only admin can use this.' });
+  }
+  if (data.startsWith('handled:')) {
+    try {
+      await bot.editMessageText('Marked handled ✅', { chat_id: cq.message.chat.id, message_id: cq.message.message_id });
+      return bot.answerCallbackQuery(cq.id, { text: 'Marked handled' });
+    } catch (e) {
+      return bot.answerCallbackQuery(cq.id, { text: 'Action failed' });
+    }
+  }
+  return bot.answerCallbackQuery(cq.id, { text: 'Unknown action' });
+});
+
+// main message handler
 bot.on('message', async (msg) => {
   try {
-    // ignore group messages except commands
-    if (!msg.chat || msg.chat.type !== 'private') {
-      return;
-    }
-
-    // ignore commands in this handler
-    if (msg.text && msg.text.startsWith('/')) return;
-
+    if (!msg.chat || msg.chat.type !== 'private') return; // only handle private chats here
     const chatId = msg.chat.id;
     const fromId = msg.from.id;
 
-    // Admin sent a document -> capture file_id and append
+    // admin uploaded a document
     if (msg.document && isAdmin(fromId)) {
-      // If caption present, expect caption format: id|title|author
       const file_id = msg.document.file_id;
       const caption = (msg.caption || '').trim();
       if (caption) {
+        // expect id|title|author
         const parts = caption.split('|').map(s => s.trim());
         const id = parts[0] || '';
         const title = parts[1] || '';
         const author = parts[2] || '';
         if (!title || !file_id) {
-          return bot.sendMessage(chatId, 'Caption must be: id|title|author (title required). Example: 0005|My Book|Author Name');
+          return bot.sendMessage(chatId, 'Caption format: id|title|author (title required). Example: 0005|My Book|Author Name');
         }
         try {
           await appendRow(id || '', title, author || '', file_id);
           await loadSheet();
-          return bot.sendMessage(chatId, `Saved "${title}" to sheet.`);
+          return bot.sendMessage(chatId, `Saved "${title}" to the sheet.`);
         } catch (e) {
           return bot.sendMessage(chatId, `Failed to save: ${e.message}`);
         }
       } else {
-        // no caption: ask for metadata using force_reply
-        // store the file_id temporarily in memory keyed by chatId
+        // ask for metadata
         waitingForMeta[chatId] = { file_id };
         return bot.sendMessage(chatId, 'Please reply with metadata in this format: id|title|author', { reply_markup: { force_reply: true } });
       }
     }
 
-    // Admin replied with metadata after uploading (force-reply)
-    if (msg.reply_to_message && waitingForMeta[msg.chat.id] && msg.text && isAdmin(fromId)) {
+    // admin replied with metadata after upload
+    if (msg.reply_to_message && waitingForMeta[chatId] && isAdmin(fromId) && msg.text) {
       const meta = msg.text.trim();
       const parts = meta.split('|').map(s => s.trim());
       const id = parts[0] || '';
       const title = parts[1] || '';
       const author = parts[2] || '';
-      const file_id = waitingForMeta[msg.chat.id].file_id;
+      const file_id = waitingForMeta[chatId].file_id;
       if (!title || !file_id) {
         return bot.sendMessage(chatId, 'Invalid metadata. Use: id|title|author (title required).');
       }
       try {
         await appendRow(id || '', title, author || '', file_id);
-        delete waitingForMeta[msg.chat.id];
+        delete waitingForMeta[chatId];
         await loadSheet();
         return bot.sendMessage(chatId, `Saved "${title}" to sheet.`);
       } catch (e) {
@@ -198,27 +234,58 @@ bot.on('message', async (msg) => {
       }
     }
 
-    // Otherwise treat text as a search query
+    // ignore commands here
+    if (msg.text && msg.text.startsWith('/')) return;
+
+    // treat text as search query
     if (msg.text) {
       const query = msg.text.trim();
-      // fuzzy search with Fuse
       const results = fuse.search(query);
       if (!results || results.length === 0) {
-        return bot.sendMessage(chatId, `No match found for "${query}". Admins can add books by sending the file with caption: id|title|author`);
+        // no match: inform user and notify admins
+        const userMsg = isAdmin(fromId)
+          ? `No match found for "${query}". I have notified the librarian and you can add the file by sending it with caption: id|title|author.`
+          : `Sorry — I couldn't find "${query}" in the library. The librarian has been notified and will add it if available.`;
+        // send user-friendly reply
+        await bot.sendMessage(chatId, userMsg);
+
+        // notify admins with details
+        const request = {
+          userId: fromId,
+          userName: msg.from.username || `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
+          query,
+          time: new Date().toISOString()
+        };
+        await notifyAdminsAboutRequest(request);
+        return;
       }
+
+      // found something -> best match
       const best = results[0].item;
-      // send the document using file_id (Telegram will deliver actual file)
+      // admin sees extra metadata
+      if (isAdmin(fromId)) {
+        const meta = `📗 Found: ${best.title}\nID: ${best.id || '-'}\nAuthor: ${best.author || '-'}\n\nSending file now...`;
+        await bot.sendMessage(chatId, meta);
+      } else {
+        await bot.sendMessage(chatId, `Found "${best.title}" — sending file now...`);
+      }
+
       try {
-        await bot.sendDocument(chatId, best.file_id, {}, { filename: `${best.title || 'book'}.pdf` });
+        await bot.sendDocument(chatId, best.file_id, {}, { filename: `${best.title || 'book'}` });
       } catch (e) {
         console.error('sendDocument error', e.message);
-        return bot.sendMessage(chatId, `Found "${best.title}" but failed to send file: ${e.message}`);
+        // inform user + notify admins about failure
+        await bot.sendMessage(chatId, `Found "${best.title}" but failed to send it: ${e.message}. The librarian has been notified.`);
+        const failureNotice = {
+          userId: fromId,
+          userName: msg.from.username || `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
+          query: `Attempt to send "${best.title}" failed: ${e.message}`,
+          time: new Date().toISOString()
+        };
+        await notifyAdminsAboutRequest(failureNotice);
       }
     }
   } catch (err) {
-    console.error('handler error', err);
+    console.error('message handler error', err);
   }
 });
-
-// temp storage for admin uploads missing caption
-const waitingForMeta = {};
