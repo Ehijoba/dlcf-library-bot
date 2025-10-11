@@ -44,28 +44,61 @@ const safeText = (v) => {
   // remove ASCII control chars that may break things
   return String(v).replace(/[\u0000-\u001F\u007F]/g, '').trim();
 };
+
+// Don't sanitize file_ids - they need to be preserved exactly
+const safeFileId = (v) => {
+  if (v === undefined || v === null) return '';
+  return String(v).trim(); // Only trim whitespace, don't remove any characters
+};
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 ///////////////////////
-// Local DB (for requests)
+// Local DB (for requests and user stats)
 ///////////////////////
 function loadDB() {
   try {
     if (!fs.existsSync(DB_PATH)) {
-      const init = { requests: [] };
+      const init = { requests: [], userStats: {} };
       fs.writeFileSync(DB_PATH, JSON.stringify(init, null, 2));
       return init;
     }
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    const data = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    // Ensure userStats exists
+    if (!data.userStats) data.userStats = {};
+    return data;
   } catch (e) {
     log('Failed reading DB, recreating:', e.message || e);
-    const init = { requests: [] };
+    const init = { requests: [], userStats: {} };
     fs.writeFileSync(DB_PATH, JSON.stringify(init, null, 2));
     return init;
   }
 }
 function saveDB(db) { fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
 let db = loadDB();
+
+// Track user book downloads for gamification
+function trackUserDownload(userId) {
+  if (!db.userStats) db.userStats = {};
+  if (!db.userStats[userId]) {
+    db.userStats[userId] = { downloads: 0, lastDownload: null };
+  }
+  db.userStats[userId].downloads += 1;
+  db.userStats[userId].lastDownload = new Date().toISOString();
+  saveDB(db);
+  return db.userStats[userId].downloads;
+}
+
+function getUserMilestoneMessage(downloadCount) {
+  const milestones = {
+    1: `🎉 *First book downloaded!* You've taken the first step on an incredible journey!`,
+    5: `🌟 *5 books downloaded!* You're building a great reading habit!`,
+    10: `🔥 *10 books milestone!* You're on fire! Keep that momentum going!`,
+    25: `⭐ *25 books!* You're officially a dedicated reader! Impressive!`,
+    50: `💎 *50 books!* You're a reading champion! Knowledge is your superpower!`,
+    100: `👑 *100 books!* You're a reading LEGEND! Absolutely phenomenal!`
+  };
+  return milestones[downloadCount] || null;
+}
 
 ///////////////////////
 // Google Sheets setup
@@ -170,8 +203,11 @@ async function loadSheet() {
       const id = safeText(r[0] || '');
       const title = safeText(r[1] || '');
       const author = safeText(r[2] || '');
-      const file_id = safeText(r[3] || '');
-      if (title && file_id) parsed.push({ id, title, author, file_id });
+      const file_id = safeFileId(r[3] || ''); // Use safeFileId for file_ids
+      if (title && file_id) {
+        parsed.push({ id, title, author, file_id });
+        log(`Loaded: ${title} | file_id length: ${file_id.length}`);
+      }
     }
     books = parsed;
     fuse = new Fuse(books, { keys: ['title', 'author', 'id'], threshold: 0.35, includeScore: true });
@@ -189,14 +225,14 @@ async function loadSheet() {
 
 async function appendRowToSheet(id, title, author, file_id) {
   try {
-    const values = [[safeText(id || ''), safeText(title || ''), safeText(author || ''), safeText(file_id || '')]];
+    const values = [[safeText(id || ''), safeText(title || ''), safeText(author || ''), safeFileId(file_id || '')]];
     await sheetsClient.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Sheet1!A:D',
       valueInputOption: 'RAW',
       resource: { values }
     });
-    log('appendRow success', id, title);
+    log('appendRow success:', title, '| file_id:', file_id, '| length:', file_id.length);
     // small sleep to avoid quota bursts
     await sleep(200);
     return true;
@@ -308,19 +344,27 @@ async function validateAllFileIdsAndReport(adminChatId) {
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const isAdm = ADMIN_IDS.includes(String(msg.from.id));
+  const userName = msg.from.first_name || 'Reader';
+  
   if (isAdm) {
     bot.sendMessage(chatId, `👋 Librarian — bot is online. Use /reload to refresh index, /validate to validate file_ids, or send a document with caption id|title|author to add a book.`);
   } else {
-    bot.sendMessage(chatId, `📚 Welcome to DLCF Library Bot!
+    bot.sendMessage(chatId, `📚 Welcome to DLCF Library, ${userName}!
 
-🔍 **How to use:**
-• Type any book title, author, or ID to search
-• Use /browse to explore books by category
-• Use /recent to see newly added books
-• Use /popular to see most requested books
-• Use /help for more tips
+🌟 *Your reading journey starts here*
 
-If a book isn't found, the librarians will be notified automatically! 📖`);
+"The more that you read, the more things you will know. The more that you learn, the more places you'll go." – Dr. Seuss
+
+🔍 *Quick Start:*
+• Simply type any book title or author name
+• Or try these commands:
+  /browse - Discover books by author
+  /recent - See what's new
+  /popular - Trending searches
+
+💡 *Pro tip:* The best readers read daily. Even 10 pages a day adds up to 3,650 pages a year!
+
+Don't just wish to be a reader – BE ONE! Type a book title now and start your transformation! 🚀`, { parse_mode: 'Markdown' });
   }
 });
 
@@ -738,9 +782,11 @@ bot.on('message', async (msg) => {
 
     // admin uploaded a document
     if (msg.document && isAdmin(fromId)) {
-      const file_id = safeText(msg.document.file_id);
+      const file_id = safeFileId(msg.document.file_id); // Use safeFileId
       const mimeType = msg.document.mime_type || '';
       const caption = safeText(msg.caption || '');
+      
+      log('Admin uploaded document:', msg.document.file_name, '| file_id:', file_id, '| length:', file_id.length);
       
       // validate file type
       if (!isValidDocumentType(mimeType)) {
@@ -817,11 +863,25 @@ bot.on('message', async (msg) => {
         db.requests = db.requests || [];
         db.requests.push(req);
         saveDB(db);
-        // tell user
-        const userMsg = isAdmin(fromId)
-          ? `No match found for "${query}". Librarian notified — send the file to add it.`
-          : `Sorry — I couldn't find "${query}". The librarian has been notified and will add it if available.`;
-        await bot.sendMessage(chatId, userMsg);
+        
+        // tell user with motivating message
+        if (isAdmin(fromId)) {
+          await bot.sendMessage(chatId, `No match found for "${query}". Librarian notified — send the file to add it.`);
+        } else {
+          await bot.sendMessage(chatId, `📖 Great question! I couldn't find "${query}" in our library *yet*.
+
+🔔 Good news! The librarians have been notified and will add it soon if available.
+
+💡 *Meanwhile:*
+Try /browse to discover other amazing books
+Try /recent to see newly added titles
+Try /popular to see what others are reading
+
+Remember: "A reader lives a thousand lives before he dies. The man who never reads lives only one." – George R.R. Martin
+
+Keep that reading spirit alive! 🔥`, { parse_mode: 'Markdown' });
+        }
+        
         // notify admins
         await notifyAdminsAboutRequest(req).catch(e => log('notifyAdminsAboutRequest error:', e && e.message ? e.message : e));
         return;
@@ -830,29 +890,81 @@ bot.on('message', async (msg) => {
       // we have results
       const best = results[0].item;
       
+      log('🔍 Book found:', best.title, '| file_id:', best.file_id, '| length:', best.file_id.length, '| requesting user:', fromId);
+      
       // send the document directly (no pre-validation as it can cause false negatives)
       try {
-        // admin gets more detail
+        // Motivating messages for users
         if (isAdmin(fromId)) {
           await bot.sendMessage(chatId, `📗 Found: ${best.title}\nID: ${best.id || '-'}\nAuthor: ${best.author || '-'}\nSending file...`);
         } else {
-          await bot.sendMessage(chatId, `Found "${best.title}" by ${best.author || 'Unknown author'} 📖`);
+          // Engaging, motivating message for regular users
+          const motivationalMessages = [
+            `🌟 Excellent choice! "${best.title}" by ${best.author || 'a great author'} is on its way!`,
+            `📚 Great taste! Sending "${best.title}" right now. Happy reading!`,
+            `✨ Found it! "${best.title}" is yours. Time to dive into a new world!`,
+            `🎯 Perfect! "${best.title}" by ${best.author || 'an amazing author'}. Your reading journey begins now!`,
+            `📖 Wonderful! "${best.title}" awaits. Let knowledge illuminate your path!`,
+          ];
+          const randomMsg = motivationalMessages[Math.floor(Math.random() * motivationalMessages.length)];
+          await bot.sendMessage(chatId, randomMsg);
         }
         
+        log('📤 Attempting to send document with file_id:', best.file_id);
         await bot.sendDocument(chatId, best.file_id);
-        log('Successfully sent:', best.title, 'to user', fromId);
+        log('✅ Successfully sent:', best.title, 'to user', fromId);
+        
+        // Track download and check for milestones (gamification)
+        if (!isAdmin(fromId)) {
+          const downloadCount = trackUserDownload(fromId);
+          const milestoneMsg = getUserMilestoneMessage(downloadCount);
+          
+          // Send milestone achievement
+          if (milestoneMsg) {
+            setTimeout(async () => {
+              try {
+                await bot.sendMessage(chatId, milestoneMsg, { parse_mode: 'Markdown' });
+              } catch (e) {
+                // Silent fail
+              }
+            }, 1500);
+          } else {
+            // Send regular motivational follow-up
+            setTimeout(async () => {
+              const followUps = [
+                `💭 "A room without books is like a body without a soul." - Cicero\n\n📚 Books downloaded: ${downloadCount}`,
+                `🌱 Every page you read plants a seed of knowledge. Keep growing!\n\n📊 Your progress: ${downloadCount} books`,
+                `⏰ Remember: The best time to read was yesterday. The second best time is now!\n\n🎯 Books so far: ${downloadCount}`,
+                `🔥 You're building your reading habit! Keep it up!\n\n📈 Total downloads: ${downloadCount}`,
+                `💡 Knowledge is power. You've just powered up!\n\n⚡ Power level: ${downloadCount} books`
+              ];
+              try {
+                await bot.sendMessage(chatId, followUps[Math.floor(Math.random() * followUps.length)]);
+              } catch (e) {
+                // Silent fail for follow-up
+              }
+            }, 2000);
+          }
+        }
       } catch (err) {
-        log('sendDocument error for', best.title, ':', err && err.message ? err.message : err);
+        log('❌ sendDocument FAILED for', best.title);
+        log('   file_id:', best.file_id);
+        log('   file_id length:', best.file_id.length);
+        log('   error:', err);
+        log('   error message:', err && err.message ? err.message : 'unknown');
+        log('   error code:', err && err.code ? err.code : 'no code');
+        log('   error response:', err && err.response ? err.response : 'no response');
+        
         const errmsg = (err && err.message) ? err.message : 'unknown';
         
-        // User-friendly error message
-        await bot.sendMessage(chatId, `Found "${best.title}" but couldn't send the file. The librarian has been notified and will fix this. 📚`);
+        // User-friendly, encouraging error message
+        await bot.sendMessage(chatId, `📚 Found "${best.title}" but there's a temporary issue sending it.\n\n😊 Don't worry! The librarian has been notified and will fix this quickly.\n\n💪 Your thirst for knowledge is admirable! Try another book while we sort this out.`);
         
-        // Notify admins with details
+        // Notify admins with comprehensive details
         const failureNotice = {
           userId: fromId,
           userName: (msg.from.username || `${msg.from.first_name || ''}`).trim(),
-          query: `Failed to send "${best.title}" (ID: ${best.id || 'N/A'}, file_id: ${best.file_id}): ${errmsg}`,
+          query: `❌ SEND FAILED: "${best.title}" (ID: ${best.id || 'N/A'})\nfile_id: ${best.file_id}\nfile_id length: ${best.file_id.length}\nError: ${errmsg}`,
           time: new Date().toISOString()
         };
         await notifyAdminsAboutRequest(failureNotice);
