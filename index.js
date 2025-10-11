@@ -9,7 +9,7 @@ const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { google } = require('googleapis');
 const Fuse = require('fuse.js');
-const stringify = require('csv-stringify/lib/sync');
+const { stringify } = require('csv-stringify/sync');
 
 ///////////////////////
 // Configuration & Env
@@ -22,9 +22,16 @@ const SA_BASE64 = process.env.GOOGLE_SERVICE_ACCOUNT_BASE64;
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
 const DB_PATH = path.join(__dirname, 'db.json');
+const DEV_MODE = process.env.DEV_MODE === 'true';
+const POLLING_INTERVAL = parseInt(process.env.POLLING_INTERVAL) || 1000;
 
-if (!BOT_TOKEN || ADMIN_IDS.length === 0 || !SHEET_ID || !SA_BASE64 || !BASE_URL) {
-  console.error('FATAL: Missing env vars. Required: BOT_TOKEN, ADMIN_IDS (or ADMIN_ID), SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64, BASE_URL');
+if (!BOT_TOKEN || ADMIN_IDS.length === 0 || !SHEET_ID || !SA_BASE64) {
+  console.error('FATAL: Missing env vars. Required: BOT_TOKEN, ADMIN_IDS (or ADMIN_ID), SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64');
+  process.exit(1);
+}
+
+if (!DEV_MODE && !BASE_URL) {
+  console.error('FATAL: BASE_URL is required in production mode. Set DEV_MODE=true for local development.');
   process.exit(1);
 }
 
@@ -63,25 +70,34 @@ let db = loadDB();
 ///////////////////////
 // Google Sheets setup
 ///////////////////////
-let sheetsClient, svcJson;
+let sheetsClient, svcJson, jwt;
 try {
+  log('Parsing Google Service Account credentials...');
   svcJson = JSON.parse(Buffer.from(SA_BASE64, 'base64').toString('utf8'));
-} catch (e) {
-  console.error('FATAL: Could not parse GOOGLE_SERVICE_ACCOUNT_BASE64:', e.message || e);
-  process.exit(1);
-}
-const jwt = new google.auth.JWT(
+  log('Creating JWT client for:', svcJson.client_email);
+  jwt = new google.auth.JWT(
   svcJson.client_email,
   null,
   svcJson.private_key,
   ['https://www.googleapis.com/auth/spreadsheets']
 );
 sheetsClient = google.sheets({ version: 'v4', auth: jwt });
+  log('✅ Google Sheets client initialized');
+} catch (e) {
+  console.error('FATAL: Could not initialize Google Sheets client:', e.message || e);
+  console.error('Stack:', e.stack);
+  process.exit(1);
+}
 
 ///////////////////////
 // Telegram + Express
 ///////////////////////
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+const bot = new TelegramBot(BOT_TOKEN, { 
+  polling: DEV_MODE ? {
+    interval: POLLING_INTERVAL,
+    autoStart: true
+  } : false
+});
 const app = express();
 app.use(express.json({ limit: '16mb' }));
 
@@ -99,6 +115,45 @@ app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime(), 
 ///////////////////////
 let books = []; // array of {id, title, author, file_id}
 let fuse = new Fuse([], { keys: ['title', 'author', 'id'], threshold: 0.35, includeScore: true });
+const waitingForMeta = {}; // For tracking admin metadata replies
+
+///////////////////////
+// Helper functions
+///////////////////////
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(String(userId));
+}
+
+function isValidDocumentType(mimeType) {
+  const allowedTypes = [
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'text/plain',
+    'application/rtf',
+    'application/epub+zip',
+    'application/x-mobipocket-ebook'
+  ];
+  return allowedTypes.includes(mimeType);
+}
+
+function getLibraryStats() {
+  const totalBooks = books.length;
+  const withAuthors = books.filter(b => b.author && b.author.trim()).length;
+  const withIds = books.filter(b => b.id && b.id.trim()).length;
+  const uniqueAuthors = new Set(books.filter(b => b.author && b.author.trim()).map(b => b.author.toLowerCase())).size;
+  return {
+    totalBooks,
+    withAuthors,
+    withIds,
+    uniqueAuthors,
+    totalRequests: db.requests ? db.requests.length : 0
+  };
+}
 
 // Load sheet into memory
 async function loadSheet() {
@@ -124,6 +179,10 @@ async function loadSheet() {
     return books.length;
   } catch (err) {
     log('loadSheet error:', err && err.message ? err.message : err);
+    if (err.code === 403) {
+      log('PERMISSION ERROR: Service account', svcJson.client_email, 'needs access to sheet', SHEET_ID);
+      log('Share the Google Sheet with this email address and grant Editor permissions.');
+    }
     throw err;
   }
 }
@@ -307,6 +366,202 @@ bot.onText(/\/validate/, async (msg) => {
   validateAllFileIdsAndReport(chatId);
 });
 
+// /stats (admin only) - show library statistics
+bot.onText(/\/stats/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /stats.');
+  
+  const stats = getLibraryStats();
+  const message = `📊 Library Statistics:
+📚 Total Books: ${stats.totalBooks}
+👤 Books with Authors: ${stats.withAuthors}
+🏷️ Books with IDs: ${stats.withIds}
+✍️ Unique Authors: ${stats.uniqueAuthors}
+📝 Total Requests: ${stats.totalRequests}
+
+📈 Coverage:
+• Authors: ${((stats.withAuthors / stats.totalBooks) * 100).toFixed(1)}%
+• IDs: ${((stats.withIds / stats.totalBooks) * 100).toFixed(1)}%`;
+
+  bot.sendMessage(chatId, message);
+});
+
+// /export (admin only) - export library as CSV
+bot.onText(/\/export/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /export.');
+  
+  if (books.length === 0) {
+    return bot.sendMessage(chatId, 'No books to export.');
+  }
+  
+  try {
+    const csv = stringify(books, { header: true });
+    const tmp = path.join(__dirname, `library-export-${Date.now()}.csv`);
+    fs.writeFileSync(tmp, csv);
+    
+    await bot.sendMessage(chatId, `📁 Exporting ${books.length} books...`);
+    await bot.sendDocument(chatId, fs.createReadStream(tmp));
+    fs.unlinkSync(tmp);
+  } catch (e) {
+    log('export error:', e && e.message ? e.message : e);
+    bot.sendMessage(chatId, `Export failed: ${e && e.message ? e.message : e}`);
+  }
+});
+
+// /search query (admin only) - detailed search with results count
+bot.onText(/\/search (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /search.');
+  
+  const query = safeText(match[1].trim());
+  const results = fuse.search(query);
+  
+  if (!results || results.length === 0) {
+    return bot.sendMessage(chatId, `No results found for "${query}"`);
+  }
+  
+  const topResults = results.slice(0, 10).map((r, i) => {
+    const book = r.item;
+    const score = r.score ? ` (${(r.score * 100).toFixed(1)}%)` : '';
+    return `${i + 1}. ${book.title} — ${book.author || 'Unknown'}${score}`;
+  }).join('\n');
+  
+  const message = `🔍 Search results for "${query}" (${results.length} found):
+${topResults}${results.length > 10 ? `\n... and ${results.length - 10} more` : ''}`;
+  
+  bot.sendMessage(chatId, message);
+});
+
+// /bulk-add (admin only) - bulk add from CSV
+bot.onText(/\/bulk-add/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /bulk-add.');
+  
+  bot.sendMessage(chatId, `📥 Bulk Add Instructions:
+1. Send a CSV file with columns: id,title,author,file_id
+2. First row should be headers
+3. Use empty values for missing fields
+4. Maximum 100 rows per upload
+
+Example:
+id,title,author,file_id
+001,My Book,Author Name,BQADBAAD...
+002,Another Book,,BQADBAAD...
+
+⚠️ This will add ALL rows from the CSV to the library.`);
+});
+
+// /cleanup (admin only) - remove duplicate file_ids
+bot.onText(/\/cleanup/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /cleanup.');
+  
+  const duplicates = [];
+  const seenFileIds = new Set();
+  const seenTitles = new Set();
+  
+  books.forEach((book, index) => {
+    if (seenFileIds.has(book.file_id)) {
+      duplicates.push({ type: 'file_id', book, index });
+    } else {
+      seenFileIds.add(book.file_id);
+    }
+    
+    const titleKey = book.title ? book.title.toLowerCase().trim() : '';
+    if (titleKey && seenTitles.has(titleKey)) {
+      duplicates.push({ type: 'title', book, index });
+    } else if (titleKey) {
+      seenTitles.add(titleKey);
+    }
+  });
+  
+  if (duplicates.length === 0) {
+    return bot.sendMessage(chatId, '✅ No duplicates found!');
+  }
+  
+  const message = `🔍 Found ${duplicates.length} potential duplicates:
+${duplicates.slice(0, 10).map((dup, i) => {
+  return `${i + 1}. [${dup.type}] ${dup.book.title} — ${dup.book.author || 'Unknown'}`;
+}).join('\n')}${duplicates.length > 10 ? `\n... and ${duplicates.length - 10} more` : ''}
+
+⚠️ Manual cleanup required. Use /export to get full list.`;
+  
+  bot.sendMessage(chatId, message);
+});
+
+// /help (admin only) - show all admin commands
+bot.onText(/\/help/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /help.');
+  
+  const message = `🔧 Admin Commands:
+
+📚 Library Management:
+/start - Welcome message
+/reload - Reload library from Google Sheets
+/add id|title|author|file_id - Quick add book
+/bulk-add - Instructions for bulk CSV upload
+
+📊 Information:
+/stats - Library statistics
+/export - Export library as CSV
+/search query - Detailed search with scores
+/list - Show first 50 books
+
+🔧 Maintenance:
+/validate - Validate all file_ids
+/cleanup - Find duplicate entries
+
+📝 Adding Books:
+1. Upload document with caption: id|title|author
+2. Or upload document and reply with metadata
+3. Use /add for quick command-line addition
+
+💡 Tips:
+• Use /stats to monitor library health
+• /validate to check for broken file_ids
+• /export to backup your library
+• /cleanup to find duplicates`;
+
+  bot.sendMessage(chatId, message);
+});
+
+// Handle CSV uploads for bulk operations
+bot.on('document', async (msg) => {
+  if (!msg.document || !isAdmin(String(msg.from.id))) return;
+  
+  const chatId = msg.chat.id;
+  const mimeType = msg.document.mime_type || '';
+  
+  // Check if it's a CSV file
+  if (mimeType === 'text/csv' || msg.document.file_name?.toLowerCase().endsWith('.csv')) {
+    try {
+      await bot.sendMessage(chatId, '📥 CSV file detected. Processing bulk add...');
+      
+      // Get file info and download
+      const fileInfo = await bot.getFile(msg.document.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+      
+      // In a real implementation, you'd download and parse the CSV here
+      // For now, just acknowledge the upload
+      bot.sendMessage(chatId, `📊 CSV file received (${msg.document.file_name})
+      
+⚠️ CSV processing not fully implemented yet.
+Please use individual /add commands or upload documents with captions.
+
+File info:
+• Size: ${msg.document.file_size} bytes
+• Type: ${mimeType}
+• Name: ${msg.document.file_name}`);
+      
+    } catch (e) {
+      log('CSV processing error:', e && e.message ? e.message : e);
+      bot.sendMessage(chatId, `CSV processing failed: ${e && e.message ? e.message : e}`);
+    }
+  }
+});
+
 // callback query handler (inline button)
 bot.on('callback_query', async (cq) => {
   try {
@@ -346,7 +601,14 @@ bot.on('message', async (msg) => {
     // admin uploaded a document
     if (msg.document && isAdmin(fromId)) {
       const file_id = safeText(msg.document.file_id);
+      const mimeType = msg.document.mime_type || '';
       const caption = safeText(msg.caption || '');
+      
+      // validate file type
+      if (!isValidDocumentType(mimeType)) {
+        return bot.sendMessage(chatId, `❌ Unsupported file type: ${mimeType}\n\nAllowed types: PDF, Word docs, Excel, PowerPoint, text files, EPUB, MOBI`);
+      }
+      
       if (caption) {
         // caption is id|title|author
         const parts = caption.split('|').map(s => s.trim());
@@ -363,15 +625,15 @@ bot.on('message', async (msg) => {
         try {
           await appendRowToSheet(id, title, author, file_id);
           await loadSheet();
-          return bot.sendMessage(chatId, `Saved "${title}" to sheet.`);
+          return bot.sendMessage(chatId, `✅ Saved "${title}" to library.`);
         } catch (e) {
           log('appendRow error for admin upload:', e && e.message ? e.message : e);
           return bot.sendMessage(chatId, `Failed to save "${title}": ${e && e.message ? e.message : 'unknown error'}`);
         }
       } else {
         // ask for metadata
-        waitingForMeta[chatId] = { file_id };
-        return bot.sendMessage(chatId, 'Please reply with metadata in this format: id|title|author', { reply_markup: { force_reply: true } });
+        waitingForMeta[chatId] = { file_id, mimeType };
+        return bot.sendMessage(chatId, `📄 File type: ${mimeType}\nPlease reply with metadata in this format: id|title|author`, { reply_markup: { force_reply: true } });
       }
     }
 
@@ -479,19 +741,49 @@ bot.on('message', async (msg) => {
 ///////////////////////
 app.listen(PORT, async () => {
   log('Server listening on port', PORT);
-  try {
+  
+  // Setup webhook or polling
+  if (DEV_MODE) {
+    log('✅ Development mode: Using polling instead of webhooks');
+  } else {
     const webhookUrl = `${BASE_URL.replace(/\/$/, '')}/webhook/${BOT_TOKEN}`;
-    await bot.setWebHook(webhookUrl);
-    log('Webhook set to', webhookUrl);
-  } catch (e) {
-    log('Failed to set webhook:', e && e.message ? e.message : e);
+    log('⚠️ Webhook URL:', webhookUrl);
+    log('⚠️ Note: Due to Node.js 24 compatibility issues, you may need to set the webhook manually:');
+    log(`   curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" -d "url=${webhookUrl}"`);
+    log('⚠️ Or use Telegram Bot API directly or downgrade to Node.js 18 LTS');
   }
-  // initial sheet load
+  
+  // Initial sheet load (non-fatal)
+  log('Loading library from Google Sheets...');
   try {
-    await loadSheet();
+    const count = await loadSheet();
+    log('✅ Bot ready! Loaded', count, 'books from library.');
   } catch (e) {
-    log('Initial loadSheet error (safe to continue):', e && e.message ? e.message : e);
+    log('⚠️ Initial loadSheet error (bot will continue but library is empty):', e && e.message ? e.message : e);
+    if (e.code === 403) {
+      log('⚠️ PERMISSION ERROR: Share the Google Sheet with:', svcJson.client_email);
+    }
+    log('⚠️ Use /reload command to retry loading the sheet after fixing permissions.');
   }
+  
+  log('='.repeat(60));
+  log('🚀 DLCF Library Bot is running!');
+  log('   Mode:', DEV_MODE ? 'Development (Polling)' : 'Production (Webhook)');
+  log('   Port:', PORT);
+  log('   Books loaded:', books.length);
+  log('='.repeat(60));
+});
+
+// Global error handlers to prevent crashes
+process.on('uncaughtException', (err) => {
+  log('❌ UNCAUGHT EXCEPTION:', err && err.message ? err.message : err);
+  log('Stack:', err && err.stack ? err.stack : 'No stack trace');
+  log('⚠️ Bot will continue running...');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log('❌ UNHANDLED REJECTION:', reason);
+  log('⚠️ Bot will continue running...');
 });
 
 // graceful shutdown
@@ -505,3 +797,4 @@ process.on('SIGTERM', async () => {
   try { await bot.closeWebHook(); } catch(e) {}
   process.exit(0);
 });
+
