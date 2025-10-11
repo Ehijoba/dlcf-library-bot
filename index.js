@@ -311,7 +311,157 @@ bot.onText(/\/start/, (msg) => {
   if (isAdm) {
     bot.sendMessage(chatId, `👋 Librarian — bot is online. Use /reload to refresh index, /validate to validate file_ids, or send a document with caption id|title|author to add a book.`);
   } else {
-    bot.sendMessage(chatId, `📚 Welcome to the library bot!\nType title, author or id to search.\nIf not found your request will be sent to the librarian.`);
+    bot.sendMessage(chatId, `📚 Welcome to DLCF Library Bot!
+
+🔍 **How to use:**
+• Type any book title, author, or ID to search
+• Use /browse to explore books by category
+• Use /recent to see newly added books
+• Use /popular to see most requested books
+• Use /help for more tips
+
+If a book isn't found, the librarians will be notified automatically! 📖`);
+  }
+});
+
+// /browse - Browse books with pagination
+bot.onText(/\/browse/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (books.length === 0) {
+    return bot.sendMessage(chatId, '📚 Library is empty. Check back later!');
+  }
+  
+  // Get unique authors
+  const authors = [...new Set(books.filter(b => b.author && b.author.trim()).map(b => b.author))].sort();
+  
+  if (authors.length === 0) {
+    return bot.sendMessage(chatId, '📚 No authors available for browsing yet.');
+  }
+  
+  // Show first 20 authors with inline keyboard
+  const authorsToShow = authors.slice(0, 20);
+  const keyboard = authorsToShow.map(author => [{
+    text: `${author} (${books.filter(b => b.author === author).length} books)`,
+    callback_data: `author:${author}`
+  }]);
+  
+  bot.sendMessage(chatId, `📚 Browse by Author (showing ${authorsToShow.length} of ${authors.length}):\n\nClick an author to see their books:`, {
+    reply_markup: { inline_keyboard: keyboard }
+  });
+});
+
+// /recent - Show recently added books
+bot.onText(/\/recent/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (books.length === 0) {
+    return bot.sendMessage(chatId, '📚 Library is empty. Check back later!');
+  }
+  
+  // Show last 15 books (assuming they're in order added)
+  const recentBooks = books.slice(-15).reverse();
+  const message = `🆕 **Recently Added Books:**\n\n${recentBooks.map((b, i) => 
+    `${i + 1}. **${b.title}**\n   ${b.author ? `by ${b.author}` : 'Author unknown'}\n   ${b.id ? `ID: ${b.id}` : ''}`
+  ).join('\n\n')}\n\n💡 Type any title to get the book!`;
+  
+  bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+});
+
+// /popular - Show most requested books
+bot.onText(/\/popular/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (!db.requests || db.requests.length === 0) {
+    return bot.sendMessage(chatId, '📊 No request data yet. Start searching for books!');
+  }
+  
+  // Count request frequencies
+  const queryCounts = {};
+  db.requests.forEach(req => {
+    const query = req.query.toLowerCase().trim();
+    queryCounts[query] = (queryCounts[query] || 0) + 1;
+  });
+  
+  // Get top 10 most requested
+  const topRequests = Object.entries(queryCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+  
+  if (topRequests.length === 0) {
+    return bot.sendMessage(chatId, '📊 No popular searches yet.');
+  }
+  
+  const message = `🔥 **Most Popular Searches:**\n\n${topRequests.map((([query, count], i) => 
+    `${i + 1}. "${query}" - ${count} request${count > 1 ? 's' : ''}`
+  )).join('\n')}\n\n💡 Try searching for any of these!`;
+  
+  bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+});
+
+// /help - User help command
+bot.onText(/\/help/, async (msg) => {
+  const chatId = msg.chat.id;
+  const isAdm = isAdmin(msg.from.id);
+  
+  if (isAdm) {
+    // Admin help (existing)
+    const message = `🔧 Admin Commands:
+
+📚 Library Management:
+/start - Welcome message
+/reload - Reload library from Google Sheets
+/add id|title|author|file_id - Quick add book
+/bulk-add - Instructions for bulk CSV upload
+
+📊 Information:
+/stats - Library statistics
+/export - Export library as CSV
+/search query - Detailed search with scores
+/list - Show first 50 books
+
+🔧 Maintenance:
+/validate - Validate all file_ids
+/cleanup - Find duplicate entries
+
+📝 Adding Books:
+1. Upload document with caption: id|title|author
+2. Or upload document and reply with metadata
+3. Use /add for quick command-line addition
+
+💡 Tips:
+• Use /stats to monitor library health
+• /validate to check for broken file_ids
+• /export to backup your library
+• /cleanup to find duplicates`;
+
+    bot.sendMessage(chatId, message);
+  } else {
+    // User help
+    const message = `❓ **How to Use DLCF Library Bot**
+
+🔍 **Search for Books:**
+Just type the book title, author name, or book ID. Example:
+• "Pride and Prejudice"
+• "Jane Austen"
+• "001"
+
+📚 **Browse & Explore:**
+/browse - Browse books by author
+/recent - See recently added books
+/popular - See what others are searching
+
+📖 **Request Books:**
+If a book isn't found, librarians are automatically notified and will add it if available!
+
+💡 **Tips:**
+• You can search partial titles or authors
+• Search is fuzzy - typos are okay!
+• Books are sent directly to you
+
+Need more help? Contact the librarian!`;
+
+    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   }
 });
 
@@ -490,42 +640,6 @@ ${duplicates.slice(0, 10).map((dup, i) => {
   bot.sendMessage(chatId, message);
 });
 
-// /help (admin only) - show all admin commands
-bot.onText(/\/help/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /help.');
-  
-  const message = `🔧 Admin Commands:
-
-📚 Library Management:
-/start - Welcome message
-/reload - Reload library from Google Sheets
-/add id|title|author|file_id - Quick add book
-/bulk-add - Instructions for bulk CSV upload
-
-📊 Information:
-/stats - Library statistics
-/export - Export library as CSV
-/search query - Detailed search with scores
-/list - Show first 50 books
-
-🔧 Maintenance:
-/validate - Validate all file_ids
-/cleanup - Find duplicate entries
-
-📝 Adding Books:
-1. Upload document with caption: id|title|author
-2. Or upload document and reply with metadata
-3. Use /add for quick command-line addition
-
-💡 Tips:
-• Use /stats to monitor library health
-• /validate to check for broken file_ids
-• /export to backup your library
-• /cleanup to find duplicates`;
-
-  bot.sendMessage(chatId, message);
-});
 
 // Handle CSV uploads for bulk operations
 bot.on('document', async (msg) => {
@@ -566,10 +680,34 @@ File info:
 bot.on('callback_query', async (cq) => {
   try {
     const fromId = String(cq.from && cq.from.id);
+    const data = cq.data || '';
+    
+    // Handle author browsing (available to all users)
+    if (data.startsWith('author:')) {
+      const author = data.substring(7);
+      const authorBooks = books.filter(b => b.author === author);
+      
+      if (authorBooks.length === 0) {
+        return bot.answerCallbackQuery(cq.id, { text: 'No books found for this author.' });
+      }
+      
+      const message = `📚 **Books by ${author}:**\n\n${authorBooks.slice(0, 20).map((b, i) => 
+        `${i + 1}. ${b.title}${b.id ? ` (ID: ${b.id})` : ''}`
+      ).join('\n')}${authorBooks.length > 20 ? `\n\n... and ${authorBooks.length - 20} more` : ''}\n\n💡 Type any title to get the book!`;
+      
+      try {
+        await bot.sendMessage(cq.message.chat.id, message, { parse_mode: 'Markdown' });
+        return bot.answerCallbackQuery(cq.id, { text: `Found ${authorBooks.length} books` });
+      } catch (e) {
+        return bot.answerCallbackQuery(cq.id, { text: 'Failed to load books' });
+      }
+    }
+    
+    // Admin-only actions
     if (!isAdmin(fromId)) {
       return bot.answerCallbackQuery(cq.id, { text: 'Only admins can use this.' });
     }
-    const data = cq.data || '';
+    
     if (data.startsWith('handled:')) {
       try {
         await bot.editMessageText('Marked handled ✅', { chat_id: cq.message.chat.id, message_id: cq.message.message_id });
@@ -691,40 +829,30 @@ bot.on('message', async (msg) => {
 
       // we have results
       const best = results[0].item;
-      // admin gets more detail
-      if (isAdmin(fromId)) {
-        await bot.sendMessage(chatId, `📗 Found: ${best.title}\nID: ${best.id || '-'}\nAuthor: ${best.author || '-'}\nSending file now...`);
-      } else {
-        await bot.sendMessage(chatId, `Found "${best.title}" — sending file now...`);
-      }
-
-      // attempt to send, but first validate file_id to provide clearer errors
-      const v = await validateFileId(best.file_id);
-      if (!v.ok) {
-        log('Invalid file_id for', best.title, best.file_id, v.error);
-        // notify user and admins
-        await bot.sendMessage(chatId, `Found "${best.title}" but the stored file_id appears invalid: ${v.error}. The librarian has been notified.`);
-        const failureNotice = {
-          userId: fromId,
-          userName: (msg.from.username || `${msg.from.first_name || ''}`).trim(),
-          query: `Invalid file_id for "${best.title}": ${v.error}`,
-          time: new Date().toISOString()
-        };
-        await notifyAdminsAboutRequest(failureNotice);
-        return;
-      }
-
-      // send the document
+      
+      // send the document directly (no pre-validation as it can cause false negatives)
       try {
+        // admin gets more detail
+        if (isAdmin(fromId)) {
+          await bot.sendMessage(chatId, `📗 Found: ${best.title}\nID: ${best.id || '-'}\nAuthor: ${best.author || '-'}\nSending file...`);
+        } else {
+          await bot.sendMessage(chatId, `Found "${best.title}" by ${best.author || 'Unknown author'} 📖`);
+        }
+        
         await bot.sendDocument(chatId, best.file_id);
+        log('Successfully sent:', best.title, 'to user', fromId);
       } catch (err) {
-        log('sendDocument error:', err && err.message ? err.message : err);
+        log('sendDocument error for', best.title, ':', err && err.message ? err.message : err);
         const errmsg = (err && err.message) ? err.message : 'unknown';
-        await bot.sendMessage(chatId, `Found "${best.title}" but failed to send the file: ${errmsg}. The librarian has been notified.`);
+        
+        // User-friendly error message
+        await bot.sendMessage(chatId, `Found "${best.title}" but couldn't send the file. The librarian has been notified and will fix this. 📚`);
+        
+        // Notify admins with details
         const failureNotice = {
           userId: fromId,
           userName: (msg.from.username || `${msg.from.first_name || ''}`).trim(),
-          query: `Attempt to send "${best.title}" failed: ${errmsg}`,
+          query: `Failed to send "${best.title}" (ID: ${best.id || 'N/A'}, file_id: ${best.file_id}): ${errmsg}`,
           time: new Date().toISOString()
         };
         await notifyAdminsAboutRequest(failureNotice);
@@ -751,6 +879,20 @@ app.listen(PORT, async () => {
     log('⚠️ Note: Due to Node.js 24 compatibility issues, you may need to set the webhook manually:');
     log(`   curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" -d "url=${webhookUrl}"`);
     log('⚠️ Or use Telegram Bot API directly or downgrade to Node.js 18 LTS');
+  }
+  
+  // Set bot commands for auto-suggestions
+  try {
+    await bot.setMyCommands([
+      { command: 'start', description: '🏠 Start the bot and see welcome message' },
+      { command: 'browse', description: '📚 Browse books by category' },
+      { command: 'recent', description: '🆕 Show recently added books' },
+      { command: 'popular', description: '🔥 Show most requested books' },
+      { command: 'help', description: '❓ Get help and usage tips' }
+    ]);
+    log('✅ Bot commands menu set successfully');
+  } catch (e) {
+    log('⚠️ Failed to set bot commands:', e && e.message ? e.message : e);
   }
   
   // Initial sheet load (non-fatal)
