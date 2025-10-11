@@ -45,10 +45,13 @@ const safeText = (v) => {
   return String(v).replace(/[\u0000-\u001F\u007F]/g, '').trim();
 };
 
-// Don't sanitize file_ids - they need to be preserved exactly
+// Clean file_ids by removing all whitespace and control characters
+// Telegram file_ids should be continuous alphanumeric + a few special chars
 const safeFileId = (v) => {
   if (v === undefined || v === null) return '';
-  return String(v).trim(); // Only trim whitespace, don't remove any characters
+  // Remove ALL whitespace characters (spaces, tabs, newlines, etc.) and control chars
+  // Telegram file_ids are base64-like strings that should have NO whitespace
+  return String(v).replace(/\s/g, '').replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim();
 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -203,10 +206,21 @@ async function loadSheet() {
       const id = safeText(r[0] || '');
       const title = safeText(r[1] || '');
       const author = safeText(r[2] || '');
-      const file_id = safeFileId(r[3] || ''); // Use safeFileId for file_ids
+      const rawFileId = r[3] || '';
+      const file_id = safeFileId(rawFileId); // Use safeFileId for file_ids
+      
+      // Log warnings for potentially corrupted file_ids
+      if (rawFileId !== file_id) {
+        log(`⚠️ CLEANED file_id for "${title}": removed ${rawFileId.length - file_id.length} chars (newlines/spaces/control chars)`);
+        log(`   Raw: "${rawFileId.substring(0, 50)}..." (length: ${rawFileId.length})`);
+        log(`   Clean: "${file_id.substring(0, 50)}..." (length: ${file_id.length})`);
+      }
+      
       if (title && file_id) {
         parsed.push({ id, title, author, file_id });
-        log(`Loaded: ${title} | file_id length: ${file_id.length}`);
+        log(`✓ Loaded: ${title} | file_id length: ${file_id.length}`);
+      } else if (title && !file_id) {
+        log(`⚠️ Skipped "${title}": missing or invalid file_id`);
       }
     }
     books = parsed;
@@ -782,11 +796,18 @@ bot.on('message', async (msg) => {
 
     // admin uploaded a document
     if (msg.document && isAdmin(fromId)) {
-      const file_id = safeFileId(msg.document.file_id); // Use safeFileId
+      const rawFileId = msg.document.file_id;
+      const file_id = safeFileId(rawFileId); // Use safeFileId
       const mimeType = msg.document.mime_type || '';
       const caption = safeText(msg.caption || '');
       
-      log('Admin uploaded document:', msg.document.file_name, '| file_id:', file_id, '| length:', file_id.length);
+      log('📤 Admin uploaded document:', msg.document.file_name);
+      log('   Raw file_id length:', rawFileId ? rawFileId.length : 0);
+      log('   Clean file_id length:', file_id.length);
+      if (rawFileId !== file_id) {
+        log('   ⚠️ file_id was cleaned (removed', (rawFileId ? rawFileId.length : 0) - file_id.length, 'chars)');
+      }
+      log('   Clean file_id:', file_id);
       
       // validate file type
       if (!isValidDocumentType(mimeType)) {
@@ -892,7 +913,26 @@ Keep that reading spirit alive! 🔥`, { parse_mode: 'Markdown' });
       
       log('🔍 Book found:', best.title, '| file_id:', best.file_id, '| length:', best.file_id.length, '| requesting user:', fromId);
       
-      // send the document directly (no pre-validation as it can cause false negatives)
+      // Validate file_id format before sending (basic sanity check)
+      if (!best.file_id || best.file_id.length < 10) {
+        log('❌ Invalid file_id detected:', best.file_id);
+        await bot.sendMessage(chatId, `📚 Found "${best.title}" but the file reference is invalid. Librarian has been notified.`);
+        const failureNotice = {
+          userId: fromId,
+          userName: (msg.from.username || `${msg.from.first_name || ''}`).trim(),
+          query: `❌ INVALID file_id: "${best.title}" (ID: ${best.id || 'N/A'})\nfile_id: "${best.file_id}"\nfile_id length: ${best.file_id.length}`,
+          time: new Date().toISOString()
+        };
+        await notifyAdminsAboutRequest(failureNotice);
+        return;
+      }
+      
+      // Check for any remaining whitespace that shouldn't be there
+      if (/\s/.test(best.file_id)) {
+        log('⚠️ WARNING: file_id contains whitespace! This will likely fail:', best.file_id);
+      }
+      
+      // send the document
       try {
         // Motivating messages for users
         if (isAdmin(fromId)) {

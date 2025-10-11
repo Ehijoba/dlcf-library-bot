@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "engines": { "node": "18.x" },
-  "scripts": { "start": "node index.js" },
+  "scripts": { 
+    "start": "node index.js",
+    "dev": "node -e \"process.env.DEV_MODE='true'; require('./index.js')\""
+  },
   "dependencies": {
     "dotenv": "^16.0.0",
     "express": "^4.18.2",

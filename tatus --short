@@ -1,0 +1,411 @@
+[1mdiff --git a/index.js b/index.js[m
+[1mindex 0da8f51..2487ad8 100644[m
+[1m--- a/index.js[m
+[1m+++ b/index.js[m
+[36m@@ -9,7 +9,7 @@[m [mconst express = require('express');[m
+ const TelegramBot = require('node-telegram-bot-api');[m
+ const { google } = require('googleapis');[m
+ const Fuse = require('fuse.js');[m
+[31m-const stringify = require('csv-stringify/lib/sync');[m
+[32m+[m[32mconst { stringify } = require('csv-stringify/sync');[m
+ [m
+ ///////////////////////[m
+ // Configuration & Env[m
+[36m@@ -22,9 +22,16 @@[m [mconst SA_BASE64 = process.env.GOOGLE_SERVICE_ACCOUNT_BASE64;[m
+ const BASE_URL = process.env.BASE_URL;[m
+ const PORT = process.env.PORT || 3000;[m
+ const DB_PATH = path.join(__dirname, 'db.json');[m
+[32m+[m[32mconst DEV_MODE = process.env.DEV_MODE === 'true';[m
+[32m+[m[32mconst POLLING_INTERVAL = parseInt(process.env.POLLING_INTERVAL) || 1000;[m
+ [m
+[31m-if (!BOT_TOKEN || ADMIN_IDS.length === 0 || !SHEET_ID || !SA_BASE64 || !BASE_URL) {[m
+[31m-  console.error('FATAL: Missing env vars. Required: BOT_TOKEN, ADMIN_IDS (or ADMIN_ID), SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64, BASE_URL');[m
+[32m+[m[32mif (!BOT_TOKEN || ADMIN_IDS.length === 0 || !SHEET_ID || !SA_BASE64) {[m
+[32m+[m[32m  console.error('FATAL: Missing env vars. Required: BOT_TOKEN, ADMIN_IDS (or ADMIN_ID), SHEET_ID, GOOGLE_SERVICE_ACCOUNT_BASE64');[m
+[32m+[m[32m  process.exit(1);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mif (!DEV_MODE && !BASE_URL) {[m
+[32m+[m[32m  console.error('FATAL: BASE_URL is required in production mode. Set DEV_MODE=true for local development.');[m
+   process.exit(1);[m
+ }[m
+ [m
+[36m@@ -63,25 +70,34 @@[m [mlet db = loadDB();[m
+ ///////////////////////[m
+ // Google Sheets setup[m
+ ///////////////////////[m
+[31m-let sheetsClient, svcJson;[m
+[32m+[m[32mlet sheetsClient, svcJson, jwt;[m
+ try {[m
+[32m+[m[32m  log('Parsing Google Service Account credentials...');[m
+   svcJson = JSON.parse(Buffer.from(SA_BASE64, 'base64').toString('utf8'));[m
+[31m-} catch (e) {[m
+[31m-  console.error('FATAL: Could not parse GOOGLE_SERVICE_ACCOUNT_BASE64:', e.message || e);[m
+[31m-  process.exit(1);[m
+[31m-}[m
+[31m-const jwt = new google.auth.JWT([m
+[32m+[m[32m  log('Creating JWT client for:', svcJson.client_email);[m
+[32m+[m[32m  jwt = new google.auth.JWT([m
+   svcJson.client_email,[m
+   null,[m
+   svcJson.private_key,[m
+   ['https://www.googleapis.com/auth/spreadsheets'][m
+ );[m
+ sheetsClient = google.sheets({ version: 'v4', auth: jwt });[m
+[32m+[m[32m  log('✅ Google Sheets client initialized');[m
+[32m+[m[32m} catch (e) {[m
+[32m+[m[32m  console.error('FATAL: Could not initialize Google Sheets client:', e.message || e);[m
+[32m+[m[32m  console.error('Stack:', e.stack);[m
+[32m+[m[32m  process.exit(1);[m
+[32m+[m[32m}[m
+ [m
+ ///////////////////////[m
+ // Telegram + Express[m
+ ///////////////////////[m
+[31m-const bot = new TelegramBot(BOT_TOKEN, { polling: false });[m
+[32m+[m[32mconst bot = new TelegramBot(BOT_TOKEN, {[m[41m [m
+[32m+[m[32m  polling: DEV_MODE ? {[m
+[32m+[m[32m    interval: POLLING_INTERVAL,[m
+[32m+[m[32m    autoStart: true[m
+[32m+[m[32m  } : false[m
+[32m+[m[32m});[m
+ const app = express();[m
+ app.use(express.json({ limit: '16mb' }));[m
+ [m
+[36m@@ -99,6 +115,45 @@[m [mapp.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime(),[m
+ ///////////////////////[m
+ let books = []; // array of {id, title, author, file_id}[m
+ let fuse = new Fuse([], { keys: ['title', 'author', 'id'], threshold: 0.35, includeScore: true });[m
+[32m+[m[32mconst waitingForMeta = {}; // For tracking admin metadata replies[m
+[32m+[m
+[32m+[m[32m///////////////////////[m
+[32m+[m[32m// Helper functions[m
+[32m+[m[32m///////////////////////[m
+[32m+[m[32mfunction isAdmin(userId) {[m
+[32m+[m[32m  return ADMIN_IDS.includes(String(userId));[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction isValidDocumentType(mimeType) {[m
+[32m+[m[32m  const allowedTypes = [[m
+[32m+[m[32m    'application/pdf',[m
+[32m+[m[32m    'application/msword',[m
+[32m+[m[32m    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',[m
+[32m+[m[32m    'application/vnd.ms-excel',[m
+[32m+[m[32m    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',[m
+[32m+[m[32m    'application/vnd.ms-powerpoint',[m
+[32m+[m[32m    'application/vnd.openxmlformats-officedocument.presentationml.presentation',[m
+[32m+[m[32m    'text/plain',[m
+[32m+[m[32m    'application/rtf',[m
+[32m+[m[32m    'application/epub+zip',[m
+[32m+[m[32m    'application/x-mobipocket-ebook'[m
+[32m+[m[32m  ];[m
+[32m+[m[32m  return allowedTypes.includes(mimeType);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction getLibraryStats() {[m
+[32m+[m[32m  const totalBooks = books.length;[m
+[32m+[m[32m  const withAuthors = books.filter(b => b.author && b.author.trim()).length;[m
+[32m+[m[32m  const withIds = books.filter(b => b.id && b.id.trim()).length;[m
+[32m+[m[32m  const uniqueAuthors = new Set(books.filter(b => b.author && b.author.trim()).map(b => b.author.toLowerCase())).size;[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    totalBooks,[m
+[32m+[m[32m    withAuthors,[m
+[32m+[m[32m    withIds,[m
+[32m+[m[32m    uniqueAuthors,[m
+[32m+[m[32m    totalRequests: db.requests ? db.requests.length : 0[m
+[32m+[m[32m  };[m
+[32m+[m[32m}[m
+ [m
+ // Load sheet into memory[m
+ async function loadSheet() {[m
+[36m@@ -124,6 +179,10 @@[m [masync function loadSheet() {[m
+     return books.length;[m
+   } catch (err) {[m
+     log('loadSheet error:', err && err.message ? err.message : err);[m
+[32m+[m[32m    if (err.code === 403) {[m
+[32m+[m[32m      log('PERMISSION ERROR: Service account', svcJson.client_email, 'needs access to sheet', SHEET_ID);[m
+[32m+[m[32m      log('Share the Google Sheet with this email address and grant Editor permissions.');[m
+[32m+[m[32m    }[m
+     throw err;[m
+   }[m
+ }[m
+[36m@@ -307,6 +366,202 @@[m [mbot.onText(/\/validate/, async (msg) => {[m
+   validateAllFileIdsAndReport(chatId);[m
+ });[m
+ [m
+[32m+[m[32m// /stats (admin only) - show library statistics[m
+[32m+[m[32mbot.onText(/\/stats/, async (msg) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /stats.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  const stats = getLibraryStats();[m
+[32m+[m[32m  const message = `📊 Library Statistics:[m
+[32m+[m[32m📚 Total Books: ${stats.totalBooks}[m
+[32m+[m[32m👤 Books with Authors: ${stats.withAuthors}[m
+[32m+[m[32m🏷️ Books with IDs: ${stats.withIds}[m
+[32m+[m[32m✍️ Unique Authors: ${stats.uniqueAuthors}[m
+[32m+[m[32m📝 Total Requests: ${stats.totalRequests}[m
+[32m+[m
+[32m+[m[32m📈 Coverage:[m
+[32m+[m[32m• Authors: ${((stats.withAuthors / stats.totalBooks) * 100).toFixed(1)}%[m
+[32m+[m[32m• IDs: ${((stats.withIds / stats.totalBooks) * 100).toFixed(1)}%`;[m
+[32m+[m
+[32m+[m[32m  bot.sendMessage(chatId, message);[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// /export (admin only) - export library as CSV[m
+[32m+[m[32mbot.onText(/\/export/, async (msg) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /export.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (books.length === 0) {[m
+[32m+[m[32m    return bot.sendMessage(chatId, 'No books to export.');[m
+[32m+[m[32m  }[m
+[32m+[m[41m  [m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const csv = stringify(books, { header: true });[m
+[32m+[m[32m    const tmp = path.join(__dirname, `library-export-${Date.now()}.csv`);[m
+[32m+[m[32m    fs.writeFileSync(tmp, csv);[m
+[32m+[m[41m    [m
+[32m+[m[32m    await bot.sendMessage(chatId, `📁 Exporting ${books.length} books...`);[m
+[32m+[m[32m    await bot.sendDocument(chatId, fs.createReadStream(tmp));[m
+[32m+[m[32m    fs.unlinkSync(tmp);[m
+[32m+[m[32m  } catch (e) {[m
+[32m+[m[32m    log('export error:', e && e.message ? e.message : e);[m
+[32m+[m[32m    bot.sendMessage(chatId, `Export failed: ${e && e.message ? e.message : e}`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// /search query (admin only) - detailed search with results count[m
+[32m+[m[32mbot.onText(/\/search (.+)/, async (msg, match) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /search.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  const query = safeText(match[1].trim());[m
+[32m+[m[32m  const results = fuse.search(query);[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (!results || results.length === 0) {[m
+[32m+[m[32m    return bot.sendMessage(chatId, `No results found for "${query}"`);[m
+[32m+[m[32m  }[m
+[32m+[m[41m  [m
+[32m+[m[32m  const topResults = results.slice(0, 10).map((r, i) => {[m
+[32m+[m[32m    const book = r.item;[m
+[32m+[m[32m    const score = r.score ? ` (${(r.score * 100).toFixed(1)}%)` : '';[m
+[32m+[m[32m    return `${i + 1}. ${book.title} — ${book.author || 'Unknown'}${score}`;[m
+[32m+[m[32m  }).join('\n');[m
+[32m+[m[41m  [m
+[32m+[m[32m  const message = `🔍 Search results for "${query}" (${results.length} found):[m
+[32m+[m[32m${topResults}${results.length > 10 ? `\n... and ${results.length - 10} more` : ''}`;[m
+[32m+[m[41m  [m
+[32m+[m[32m  bot.sendMessage(chatId, message);[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// /bulk-add (admin only) - bulk add from CSV[m
+[32m+[m[32mbot.onText(/\/bulk-add/, async (msg) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /bulk-add.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  bot.sendMessage(chatId, `📥 Bulk Add Instructions:[m
+[32m+[m[32m1. Send a CSV file with columns: id,title,author,file_id[m
+[32m+[m[32m2. First row should be headers[m
+[32m+[m[32m3. Use empty values for missing fields[m
+[32m+[m[32m4. Maximum 100 rows per upload[m
+[32m+[m
+[32m+[m[32mExample:[m
+[32m+[m[32mid,title,author,file_id[m
+[32m+[m[32m001,My Book,Author Name,BQADBAAD...[m
+[32m+[m[32m002,Another Book,,BQADBAAD...[m
+[32m+[m
+[32m+[m[32m⚠️ This will add ALL rows from the CSV to the library.`);[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// /cleanup (admin only) - remove duplicate file_ids[m
+[32m+[m[32mbot.onText(/\/cleanup/, async (msg) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /cleanup.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  const duplicates = [];[m
+[32m+[m[32m  const seenFileIds = new Set();[m
+[32m+[m[32m  const seenTitles = new Set();[m
+[32m+[m[41m  [m
+[32m+[m[32m  books.forEach((book, index) => {[m
+[32m+[m[32m    if (seenFileIds.has(book.file_id)) {[m
+[32m+[m[32m      duplicates.push({ type: 'file_id', book, index });[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m      seenFileIds.add(book.file_id);[m
+[32m+[m[32m    }[m
+[32m+[m[41m    [m
+[32m+[m[32m    const titleKey = book.title ? book.title.toLowerCase().trim() : '';[m
+[32m+[m[32m    if (titleKey && seenTitles.has(titleKey)) {[m
+[32m+[m[32m      duplicates.push({ type: 'title', book, index });[m
+[32m+[m[32m    } else if (titleKey) {[m
+[32m+[m[32m      seenTitles.add(titleKey);[m
+[32m+[m[32m    }[m
+[32m+[m[32m  });[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (duplicates.length === 0) {[m
+[32m+[m[32m    return bot.sendMessage(chatId, '✅ No duplicates found!');[m
+[32m+[m[32m  }[m
+[32m+[m[41m  [m
+[32m+[m[32m  const message = `🔍 Found ${duplicates.length} potential duplicates:[m
+[32m+[m[32m${duplicates.slice(0, 10).map((dup, i) => {[m
+[32m+[m[32m  return `${i + 1}. [${dup.type}] ${dup.book.title} — ${dup.book.author || 'Unknown'}`;[m
+[32m+[m[32m}).join('\n')}${duplicates.length > 10 ? `\n... and ${duplicates.length - 10} more` : ''}[m
+[32m+[m
+[32m+[m[32m⚠️ Manual cleanup required. Use /export to get full list.`;[m
+[32m+[m[41m  [m
+[32m+[m[32m  bot.sendMessage(chatId, message);[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// /help (admin only) - show all admin commands[m
+[32m+[m[32mbot.onText(/\/help/, async (msg) => {[m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  if (!isAdmin(msg.from.id)) return bot.sendMessage(chatId, 'Only admin can use /help.');[m
+[32m+[m[41m  [m
+[32m+[m[32m  const message = `🔧 Admin Commands:[m
+[32m+[m
+[32m+[m[32m📚 Library Management:[m
+[32m+[m[32m/start - Welcome message[m
+[32m+[m[32m/reload - Reload library from Google Sheets[m
+[32m+[m[32m/add id|title|author|file_id - Quick add book[m
+[32m+[m[32m/bulk-add - Instructions for bulk CSV upload[m
+[32m+[m
+[32m+[m[32m📊 Information:[m
+[32m+[m[32m/stats - Library statistics[m
+[32m+[m[32m/export - Export library as CSV[m
+[32m+[m[32m/search query - Detailed search with scores[m
+[32m+[m[32m/list - Show first 50 books[m
+[32m+[m
+[32m+[m[32m🔧 Maintenance:[m
+[32m+[m[32m/validate - Validate all file_ids[m
+[32m+[m[32m/cleanup - Find duplicate entries[m
+[32m+[m
+[32m+[m[32m📝 Adding Books:[m
+[32m+[m[32m1. Upload document with caption: id|title|author[m
+[32m+[m[32m2. Or upload document and reply with metadata[m
+[32m+[m[32m3. Use /add for quick command-line addition[m
+[32m+[m
+[32m+[m[32m💡 Tips:[m
+[32m+[m[32m• Use /stats to monitor library health[m
+[32m+[m[32m• /validate to check for broken file_ids[m
+[32m+[m[32m• /export to backup your library[m
+[32m+[m[32m• /cleanup to find duplicates`;[m
+[32m+[m
+[32m+[m[32m  bot.sendMessage(chatId, message);[m
+[32m+[m[32m});[m
+[32m+[m
+[32m+[m[32m// Handle CSV uploads for bulk operations[m
+[32m+[m[32mbot.on('document', async (msg) => {[m
+[32m+[m[32m  if (!msg.document || !isAdmin(String(msg.from.id))) return;[m
+[32m+[m[41m  [m
+[32m+[m[32m  const chatId = msg.chat.id;[m
+[32m+[m[32m  const mimeType = msg.document.mime_type || '';[m
+[32m+[m[41m  [m
+[32m+[m[32m  // Check if it's a CSV file[m
+[32m+[m[32m  if (mimeType === 'text/csv' || msg.document.file_name?.toLowerCase().endsWith('.csv')) {[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      await bot.sendMessage(chatId, '📥 CSV file detected. Processing bulk add...');[m
+[32m+[m[41m      [m
+[32m+[m[32m      // Get file info and download[m
+[32m+[m[32m      const fileInfo = await bot.getFile(msg.document.file_id);[m
+[32m+[m[32m      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;[m
+[32m+[m[41m      [m
+[32m+[m[32m      // In a real implementation, you'd download and parse the CSV here[m
+[32m+[m[32m      // For now, just acknowledge the upload[m
+[32m+[m[32m      bot.sendMessage(chatId, `📊 CSV file received (${msg.document.file_name})[m
+[32m+[m[41m      [m
+[32m+[m[32m⚠️ CSV processing not fully implemented yet.[m
+[32m+[m[32mPlease use individual /add commands or upload documents with captions.[m
+[32m+[m
+[32m+[m[32mFile info:[m
+[32m+[m[32m• Size: ${msg.document.file_size} bytes[m
+[32m+[m[32m• Type: ${mimeType}[m
+[32m+[m[32m• Name: ${msg.document.file_name}`);[m
+[32m+[m[41m      [m
+[32m+[m[32m    } catch (e) {[m
+[32m+[m[32m      log('CSV processing error:', e && e.message ? e.message : e);[m
+[32m+[m[32m      bot.sendMessage(chatId, `CSV processing failed: ${e && e.message ? e.message : e}`);[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }[m
+[32m+[m[32m});[m
+[32m+[m
+ // callback query handler (inline button)[m
+ bot.on('callback_query', async (cq) => {[m
+   try {[m
+[36m@@ -346,7 +601,14 @@[m [mbot.on('message', async (msg) => {[m
+     // admin uploaded a document[m
+     if (msg.document && isAdmin(fromId)) {[m
+       const file_id = safeText(msg.document.file_id);[m
+[32m+[m[32m      const mimeType = msg.document.mime_type || '';[m
+       const caption = safeText(msg.caption || '');[m
+[32m+[m[41m      [m
+[32m+[m[32m      // validate file type[m
+[32m+[m[32m      if (!isValidDocumentType(mimeType)) {[m
+[32m+[m[32m        return bot.sendMessage(chatId, `❌ Unsupported file type: ${mimeType}\n\nAllowed types: PDF, Word docs, Excel, PowerPoint, text files, EPUB, MOBI`);[m
+[32m+[m[32m      }[m
+[32m+[m[41m      [m
+       if (caption) {[m
+         // caption is id|title|author[m
+         const parts = caption.split('|').map(s => s.trim());[m
+[36m@@ -363,15 +625,15 @@[m [mbot.on('message', async (msg) => {[m
+         try {[m
+           await appendRowToSheet(id, title, author, file_id);[m
+           await loadSheet();[m
+[31m-          return bot.sendMessage(chatId, `Saved "${title}" to sheet.`);[m
+[32m+[m[32m          return bot.sendMessage(chatId, `✅ Saved "${title}" to library.`);[m
+         } catch (e) {[m
+           log('appendRow error for admin upload:', e && e.message ? e.message : e);[m
+           return bot.sendMessage(chatId, `Failed to save "${title}": ${e && e.message ? e.message : 'unknown error'}`);[m
+         }[m
+       } else {[m
+         // ask for metadata[m
+[31m-        waitingForMeta[chatId] = { file_id };[m
+[31m-        return bot.sendMessage(chatId, 'Please reply with metadata in this format: id|title|author', { reply_markup: { force_reply: true } });[m
+[32m+[m[32m        waitingForMeta[chatId] = { file_id, mimeType };[m
+[32m+[m[32m        return bot.sendMessage(chatId, `📄 File type: ${mimeType}\nPlease reply with metadata in this format: id|title|author`, { reply_markup: { force_reply: true } });[m
+       }[m
+     }[m
+ [m
+[36m@@ -479,19 +741,49 @@[m [mbot.on('message', async (msg) => {[m
+ ///////////////////////[m
+ app.listen(PORT, async () => {[m
+   log('Server listening on port', PORT);[m
+[31m-  try {[m
+[32m+[m[41m  [m
+[32m+[m[32m  // Setup webhook or polling[m
+[32m+[m[32m  if (DEV_MODE) {[m
+[32m+[m[32m    log('✅ Development mode: Using polling instead of webhooks');[m
+[32m+[m[32m  } else {[m
+     const webhookUrl = `${BASE_URL.replace(/\/$/, '')}/webhook/${BOT_TOKEN}`;[m
+[31m-    await bot.setWebHook(webhookUrl);[m
+[31m-    log('Webhook set to', webhookUrl);[m
+[31m-  } catch (e) {[m
+[31m-    log('Failed to set webhook:', e && e.message ? e.message : e);[m
+[32m+[m[32m    log('⚠️ Webhook URL:', webhookUrl);[m
+[32m+[m[32m    log('⚠️ Note: Due to Node.js 24 compatibility issues, you may need to set the webhook manually:');[m
+[32m+[m[32m    log(`   curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" -d "url=${webhookUrl}"`);[m
+[32m+[m[32m    log('⚠️ Or use Telegram Bot API directly or downgrade to Node.js 18 LTS');[m
+   }[m
+[31m-  // initial sheet load[m
+[32m+[m[41m  [m
+[32m+[m[32m  // Initial sheet load (non-fatal)[m
+[32m+[m[32m  log('Loading library from Google Sheets...');[m
+   try {[m
+[31m-    await loadSheet();[m
+[32m+[m[32m    const count = await loadSheet();[m
+[32m+[m[32m    log('✅ Bot ready! Loaded', count, 'books from library.');[m
+   } catch (e) {[m
+[31m-    log('Initial loadSheet error (safe to continue):', e && e.message ? e.message : e);[m
+[32m+[m[32m    log('⚠️ Initial loadSheet error (bot will continue but library is empty):', e && e.message ? e.message : e);[m
+[32m+[m[32m    if (e.code === 403) {[m
+[32m+[m[32m      log('⚠️ PERMISSION ERROR: Share the Google Sheet with:', svcJson.client_email);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    log('⚠️ Use /reload command to retry loading the sheet after fixing permissions.');[m
+   }[m
+[32m+[m[41m  [m
+[32m+[m[32m  log('='.repeat(60));[m
+[32m+[m[32m  log('🚀 DLCF Library Bot is running!');[m
+[32m+[m[32m  log('   Mode:', DEV_MODE ? 'Development (Polling)' : 'Production (Webhook)');[m
+[32m+[m[32m  log('   Port:', PORT);[m
+[32m+[m[32m  log('   Books loaded:', books.length);[m
+[32m+[m[32m  log(
